@@ -175,7 +175,17 @@ jobs:
             modules
           cp -v "$ZRAM_DIR/zram.ko" "$STAGE/vendor_boot/zram.ko"
 
-          # 4. Build oplus_bsp_game_opt.ko with GTS_IDX=4 (Patch 0001)
+          # Reconstruct exact coherent scheduler KCFLAGS from onyx/build_scheduler.sh
+          SCHED_OUT="$RUNNER_TEMP/oplus-scheduler-out"
+          SCHED_CPP="-D__ANDROID_COMMON_KERNEL__ -I$SCHED_OUT/stage/i1 -I$SCHED_OUT/stage/i2/x -I$KERNEL_DIR"
+          SCHED_ARGS=()
+          while IFS= read -r cfg; do
+            [ -n "$cfg" ] || continue
+            SCHED_CPP+=" -DCONFIG_${cfg}=1"
+            SCHED_ARGS+=("CONFIG_${cfg}=m")
+          done < "$SCHED_OUT/scheduler-features.txt"
+
+          # 4. Build oplus_bsp_game_opt.ko with GTS_IDX=4 (Patch 0001) + coherent scheduler flags
           echo "=== Building oplus_bsp_game_opt.ko (GTS_IDX=4) ==="
           GAME_DIR="$MODULES_DIR/vendor/oplus/kernel/cpu/game_opt"
           cat > "$GAME_DIR/Kbuild" <<'EOF'
@@ -189,16 +199,47 @@ jobs:
             oem_data/game_oem_data.o critical_task_boost.o geas_ctrl.o
           ccflags-y += -I$(src) -I$(src)/oem_data -I$(src)/task_boost -I$(src)/frame_detect
           EOF
+          make -s -C "$KOUT" M="$GAME_DIR" ARCH=arm64 LLVM=1 clean
           if make -j"$(nproc)" -C "$KOUT" M="$GAME_DIR" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-            KCFLAGS="-D__ANDROID_COMMON_KERNEL__ -Wno-error=unused-function -Wno-error=unused-variable" \
-            KBUILD_EXTRA_SYMBOLS="$SCHED_SYMVERS" modules > "$RUNNER_TEMP/mod-logs/game_opt.log" 2>&1; then
+            KCFLAGS="$SCHED_CPP -I$GAME_DIR -Wno-error=unused-function -Wno-error=unused-variable" \
+            OPLUS_OUT_OF_TREE_KO=y KBUILD_EXTRA_SYMBOLS="$SCHED_SYMVERS" \
+            "${SCHED_ARGS[@]}" modules > "$RUNNER_TEMP/mod-logs/game_opt.log" 2>&1; then
             cp -v "$GAME_DIR/oplus_bsp_game_opt.ko" "$STAGE/vendor_dlkm/modules/"
           else
             echo "::warning::oplus_bsp_game_opt.ko build failed; tail of log:"
             tail -40 "$RUNNER_TEMP/mod-logs/game_opt.log"
           fi
 
-          # 5. Build core OPlus modules via Nischay's build_oplus_mod.sh
+          # 4b. Build scheduler-header consumer modules (ipc, synchronize, mm/uxmem_opt) coherently
+          build_sched_consumer() {
+            local sub="$1"; shift
+            local dir="$MODULES_DIR/vendor/oplus/kernel/$sub"
+            local log="$RUNNER_TEMP/mod-logs/${sub//\//_}.log"
+            local extra_defs=""
+            for arg in "$@"; do extra_defs+=" -D${arg%=m}=1"; done
+            echo "=== Building coherent scheduler consumer: $sub ($*) ==="
+            make -s -C "$KOUT" M="$dir" ARCH=arm64 LLVM=1 clean
+            if make -j"$(nproc)" -C "$KOUT" M="$dir" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+              KCFLAGS="$SCHED_CPP $extra_defs -I$dir -Wno-error=unused-function -Wno-error=unused-variable" \
+              OPLUS_OUT_OF_TREE_KO=y KBUILD_MODPOST_WARN= \
+              KBUILD_EXTRA_SYMBOLS="$SCHED_SYMVERS" "${SCHED_ARGS[@]}" "$@" modules > "$log" 2>&1; then
+              for ko in "$dir"/*.ko; do
+                [ -f "$ko" ] && cp -v "$ko" "$STAGE/vendor_dlkm/modules/"
+              done
+              if [ -f "$dir/Module.symvers" ]; then
+                SCHED_SYMVERS="$SCHED_SYMVERS $dir/Module.symvers"
+              fi
+            else
+              echo "::warning::Scheduler consumer $sub failed; tail of log:"
+              tail -40 "$log"
+            fi
+          }
+
+          build_sched_consumer ipc CONFIG_OPLUS_BINDER_STRATEGY=m
+          build_sched_consumer synchronize CONFIG_OPLUS_LOCKING_STRATEGY=m
+          build_sched_consumer mm/uxmem_opt CONFIG_OPLUS_FEATURE_UXMEM_OPT=m
+
+          # 5. Build remaining standalone OPlus modules via Nischay's build_oplus_mod.sh
           cd "$MODULES_DIR"
           export KERNEL_OUT="$KOUT"
           export KBUILD_EXTRA_SYMBOLS="$SCHED_SYMVERS"
@@ -227,35 +268,32 @@ jobs:
             fi
           }
 
-          # Mandatory core OPlus framework/mm/ipc/sync/dfr modules
-          build_mod req ipc CONFIG_OPLUS_BINDER_STRATEGY=m
-          build_mod req synchronize CONFIG_OPLUS_LOCKING_STRATEGY=m
-          build_mod req hans CONFIG_OPLUS_FEATURE_HANS_GKI=m
-          build_mod req framework_stability/oplus_stability_helper CONFIG_OPLUS_FEATURE_STABILITY_HELPER=m
-          build_mod req mm/mm_osvelte CONFIG_OPLUS_FEATURE_MM_OSVELTE=m
-          build_mod req mm/mglru_opt CONFIG_OPLUS_FEATURE_MGLRU_OPT=m
-          build_mod req mm/uxmem_opt CONFIG_OPLUS_FEATURE_UXMEM_OPT=m
-          build_mod req mm/sigkill_diagnosis CONFIG_OPLUS_FEATURE_SIGKILL_DIAGNOSIS=m
-          build_mod req mm/exit_mm_optimize CONFIG_OPLUS_EXIT_MM_OPTIMIZE=m
+          # Core OPlus framework/mm/dfr/storage/power/wifi modules
+          build_mod opt hans CONFIG_OPLUS_FEATURE_HANS_GKI=m
+          build_mod opt framework_stability/oplus_stability_helper CONFIG_OPLUS_FEATURE_STABILITY_HELPER=m
+          build_mod opt mm/mm_osvelte CONFIG_OPLUS_FEATURE_MM_OSVELTE=m
+          build_mod opt mm/mglru_opt CONFIG_OPLUS_FEATURE_MGLRU_OPT=m
+          build_mod opt mm/sigkill_diagnosis CONFIG_OPLUS_FEATURE_SIGKILL_DIAGNOSIS=m
+          build_mod opt mm/exit_mm_optimize CONFIG_OPLUS_EXIT_MM_OPTIMIZE=m
           build_mod req boot/oplus_projectinfo CONFIG_OPLUS_FEATURE_OPROJECT=m
-          build_mod req boot/oplus_phoenix CONFIG_OPLUS_FEATURE_PHOENIX=m CONFIG_OPLUS_FEATURE_PHOENIX_REBOOT_SPEED=m
+          build_mod opt boot/oplus_phoenix CONFIG_OPLUS_FEATURE_PHOENIX=m CONFIG_OPLUS_FEATURE_PHOENIX_REBOOT_SPEED=m
           build_mod req dfr/common/shutdown_detect CONFIG_OPLUS_FEATURE_SHUTDOWN_DETECT=m
-          build_mod req dfr/common/theia CONFIG_OPLUS_FEATURE_THEIA=m
-          build_mod req dfr/common/kp_freeze_detect CONFIG_OPLUS_FEATURE_KP_FREEZE_DETECT=m
-          build_mod req dfr/common/init_watchdog CONFIG_OPLUS_FEATURE_INIT_WATCHDOG=m
-          build_mod req dfr/common/oplus_saupwk CONFIG_OPLUS_FEATURE_SAUPWK=m
-          build_mod req dfr/qcom/dump_device_info CONFIG_OPLUS_FEATURE_DUMP_DEVICE_INFO=m
-          build_mod req dfr/qcom/dump_reason CONFIG_OPLUS_FEATURE_DUMP_REASON=m
-          build_mod req dfr/qcom/qcom_pmic_monitor CONFIG_OPLUS_FEATURE_PMIC_MONITOR=m
-          build_mod req device_info/device_info CONFIG_OPLUS_DEVICE_IFNO=m
-          build_mod req storage/common/io_metrics CONFIG_OPLUS_FEATURE_STORAGE_IO_METRICS=m
-          build_mod req storage/storage_feature_in_module/common/ufs_oplus_dbg CONFIG_OPLUS_UFS_DRIVER=m
-          build_mod req power/standby_netlink CONFIG_OPLUS_FEATURE_POWER_NETLINK=m
-          build_mod req power/subsys_sleep_monitor/oplus_subsys_sleep_monitor CONFIG_OPLUS_SUBSYS_SLEEP_MONITOR=m
-          build_mod req wifi/oplus_connectivity_routerboost CONFIG_OPLUS_FEATURE_WIFI_ROUTERBOOST=m
-          build_mod req wifi/oplus_connectivity_sla CONFIG_OPLUS_FEATURE_WIFI_SLA=m
-          build_mod req wifi/oplus_wifi_wsa CONFIG_OPLUS_FEATURE_WIFI_SMARTANTENNA=m
-          build_mod req wifi/oplus_wificapcenter CONFIG_OPLUS_FEATURE_WIFI_CAPCENTER=m
+          build_mod opt dfr/common/theia CONFIG_OPLUS_FEATURE_THEIA=m
+          build_mod opt dfr/common/kp_freeze_detect CONFIG_OPLUS_FEATURE_KP_FREEZE_DETECT=m
+          build_mod opt dfr/common/init_watchdog CONFIG_OPLUS_FEATURE_INIT_WATCHDOG=m
+          build_mod opt dfr/common/oplus_saupwk CONFIG_OPLUS_FEATURE_SAUPWK=m
+          build_mod opt dfr/qcom/dump_device_info CONFIG_OPLUS_FEATURE_DUMP_DEVICE_INFO=m
+          build_mod opt dfr/qcom/dump_reason CONFIG_OPLUS_FEATURE_DUMP_REASON=m
+          build_mod opt dfr/qcom/qcom_pmic_monitor CONFIG_OPLUS_FEATURE_PMIC_MONITOR=m
+          build_mod opt device_info/device_info CONFIG_OPLUS_DEVICE_IFNO=m
+          build_mod opt storage/common/io_metrics CONFIG_OPLUS_FEATURE_STORAGE_IO_METRICS=m
+          build_mod opt storage/storage_feature_in_module/common/ufs_oplus_dbg CONFIG_OPLUS_UFS_DRIVER=m
+          build_mod opt power/standby_netlink CONFIG_OPLUS_FEATURE_POWER_NETLINK=m
+          build_mod opt power/subsys_sleep_monitor/oplus_subsys_sleep_monitor CONFIG_OPLUS_SUBSYS_SLEEP_MONITOR=m
+          build_mod opt wifi/oplus_connectivity_routerboost CONFIG_OPLUS_FEATURE_WIFI_ROUTERBOOST=m
+          build_mod opt wifi/oplus_connectivity_sla CONFIG_OPLUS_FEATURE_WIFI_SLA=m
+          build_mod opt wifi/oplus_wifi_wsa CONFIG_OPLUS_FEATURE_WIFI_SMARTANTENNA=m
+          build_mod opt wifi/oplus_wificapcenter CONFIG_OPLUS_FEATURE_WIFI_CAPCENTER=m
 
           # Additional OPlus modules (optional/best-effort)
           build_mod opt mm/levelprotect CONFIG_OPLUS_LEVEL_PROTECT=m CONFIG_OPLUS_FG_PROTECT=m
