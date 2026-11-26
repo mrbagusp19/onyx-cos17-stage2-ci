@@ -21,7 +21,7 @@ on:
       clang_url:
         description: "Official Google AOSP clang-r510928 archive URL"
         required: false
-        default: "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r510928.tar.gz"
+        default: "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-15.0.0_r1/clang-r510928.tar.gz"
         type: string
 
 permissions:
@@ -111,7 +111,8 @@ jobs:
           set -euo pipefail
           export PATH="$TOOLCHAIN_DIR/bin:$PATH"
           cd "$KERNEL_DIR"
-          ./build_onyx.sh modules_prepare
+          chmod +x build_onyx.sh || true
+          bash build_onyx.sh modules_prepare
           # Ensure out/Module.symvers exists for out-of-tree builds
           if [ ! -s out/Module.symvers ] && [ -s out/vmlinux.symvers ]; then
             cp out/vmlinux.symvers out/Module.symvers
@@ -131,7 +132,8 @@ jobs:
           export KERNEL_OUT="$KERNEL_DIR/out"
           export OPLUS_BUILD_OUT="$RUNNER_TEMP/oplus-scheduler-out"
           cd "$MODULES_DIR"
-          ./onyx/build_scheduler.sh
+          chmod +x onyx/build_scheduler.sh build_oplus_mod.sh || true
+          bash onyx/build_scheduler.sh
           cat "$OPLUS_BUILD_OUT/scheduler-artifacts.txt"
 
       - name: Build remaining OPlus modules, game_opt (GTS_IDX=4), onyx_stubs & hybridswap zram.ko
@@ -205,7 +207,7 @@ jobs:
             local sub="$1"; shift
             local log="$RUNNER_TEMP/mod-logs/${sub//\//_}.log"
             echo "=== Building $sub ($*) ==="
-            if ./build_oplus_mod.sh "$sub" "$@" > "$log" 2>&1; then
+            if bash build_oplus_mod.sh "$sub" "$@" > "$log" 2>&1; then
               while IFS= read -r ko; do
                 [ -f "$ko" ] && cp -v "$ko" "$STAGE/vendor_dlkm/modules/"
               done < "$log"
