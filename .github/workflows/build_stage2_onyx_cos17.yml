@@ -112,11 +112,8 @@ jobs:
           export PATH="$TOOLCHAIN_DIR/bin:$PATH"
           cd "$KERNEL_DIR"
           chmod +x build_onyx.sh || true
-          bash build_onyx.sh modules_prepare
-          # Ensure out/Module.symvers exists for out-of-tree builds
-          if [ ! -s out/Module.symvers ] && [ -s out/vmlinux.symvers ]; then
-            cp out/vmlinux.symvers out/Module.symvers
-          fi
+          # Build Image + all in-tree GKI modules (generates full out/Module.symvers incl. zsmalloc.ko zs_* CRCs!)
+          bash build_onyx.sh modules
           # Build boottime first (exports boottime_ok/bootprof_lock/get_log_count/get_bootprof_pointer CRCs)
           make -j"$(nproc)" -C out M="$KERNEL_DIR/drivers/xiaomi/boottime" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
             KCFLAGS=-D__ANDROID_COMMON_KERNEL__ \
