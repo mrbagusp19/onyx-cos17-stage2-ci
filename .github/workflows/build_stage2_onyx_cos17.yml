@@ -117,9 +117,14 @@ jobs:
           if [ ! -s out/Module.symvers ] && [ -s out/vmlinux.symvers ]; then
             cp out/vmlinux.symvers out/Module.symvers
           fi
+          # Build boottime first (exports boottime_ok/bootprof_lock/get_log_count/get_bootprof_pointer CRCs)
+          make -j"$(nproc)" -C out M="$KERNEL_DIR/drivers/xiaomi/boottime" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            KCFLAGS=-D__ANDROID_COMMON_KERNEL__ \
+            CONFIG_MI_BOOT_TIME=m modules
           # Build fixed bootmonitor.ko (fixes blkdev_put NULL holder bug still in Base HOS4)
           make -j"$(nproc)" -C out M="$KERNEL_DIR/drivers/xiaomi/bootmonitor" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
             KCFLAGS=-D__ANDROID_COMMON_KERNEL__ \
+            KBUILD_EXTRA_SYMBOLS="$KERNEL_DIR/drivers/xiaomi/boottime/Module.symvers" \
             CONFIG_MI_BOOT_MONITOR=m modules
           ls -lh out/arch/arm64/boot/Image out/vmlinux out/Module.symvers \
                  drivers/xiaomi/bootmonitor/bootmonitor.ko
