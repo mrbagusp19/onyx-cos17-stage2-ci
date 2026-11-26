@@ -118,12 +118,11 @@ jobs:
             cp out/vmlinux.symvers out/Module.symvers
           fi
           # Build fixed bootmonitor.ko (fixes blkdev_put NULL holder bug still in Base HOS4)
-          make -j"$(nproc)" O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+          make -j"$(nproc)" -C out M="$KERNEL_DIR/drivers/xiaomi/bootmonitor" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
             KCFLAGS=-D__ANDROID_COMMON_KERNEL__ \
-            HOSTCFLAGS=-Wno-incompatible-pointer-types-discards-qualifiers \
-            LOCALVERSION= M=drivers/xiaomi/bootmonitor modules
+            CONFIG_MI_BOOT_MONITOR=m modules
           ls -lh out/arch/arm64/boot/Image out/vmlinux out/Module.symvers \
-                 out/drivers/xiaomi/bootmonitor/bootmonitor.ko
+                 drivers/xiaomi/bootmonitor/bootmonitor.ko
 
       - name: Build 9 coherent scheduler modules + pahole DWARF layout check
         run: |
@@ -283,7 +282,7 @@ jobs:
           set -euo pipefail
           STAGE="$RUNNER_TEMP/stage2-bundle"
           cp -v "$KERNEL_DIR/out/arch/arm64/boot/Image" "$STAGE/Image"
-          cp -v "$KERNEL_DIR/out/drivers/xiaomi/bootmonitor/bootmonitor.ko" "$STAGE/bootmonitor/bootmonitor.ko"
+          cp -v "$KERNEL_DIR/drivers/xiaomi/bootmonitor/bootmonitor.ko" "$STAGE/bootmonitor/bootmonitor.ko"
           cp -v "$RUNNER_TEMP/onyx-tools/rebuild_vendor_dlkm.sh" "$STAGE/tools/"
           cp -v "$RUNNER_TEMP/onyx-tools/vb_drop_module.py" "$STAGE/tools/"
           cp -v "$GITHUB_WORKSPACE"/patches/*.patch "$STAGE/patches/"
