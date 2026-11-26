@@ -1,0 +1,22 @@
+From: Stage 2 CI Builder <stage2-ci-builder@onyx-cos17>
+Subject: [PATCH 1/2] game_opt: bump GTS_IDX from 3 to 4 for Base HOS4 mi_reclaim.ko
+
+On POCO F7 (onyx) Base HyperOS 4 (OS4.0.4.0.XOLCNXM), Xiaomi mi_reclaim.ko
+occupies task_struct->android_oem_data1[3] (+0xdd8), colliding with
+oplus_bsp_game_opt.ko (GTS_IDX = 3).
+
+Move GTS_IDX to android_oem_data1[4] (+0xde0), which is verified unused
+across all 934 Base HOS4 modules and all OPlus modules.
+---
+diff --git a/vendor/oplus/kernel/cpu/game_opt/oem_data/gts_common.h b/vendor/oplus/kernel/cpu/game_opt/oem_data/gts_common.h
+--- a/vendor/oplus/kernel/cpu/game_opt/oem_data/gts_common.h
++++ b/vendor/oplus/kernel/cpu/game_opt/oem_data/gts_common.h
+@@ -10,7 +10,7 @@
+ 
+ #include <linux/types.h>
+ 
+-#define GTS_IDX			3
++#define GTS_IDX			4 /* onyx HOS4: Base mi_reclaim.ko owns android_oem_data1[3] (+0xdd8) */
+ 
+ enum GAME_WAKEUP_FLAG
+ {

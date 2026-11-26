@@ -1,0 +1,76 @@
+From: Stage 2 CI Builder <stage2-ci-builder@onyx-cos17>
+Subject: [PATCH 2/2] onyx_compat_nodes: add COS17 async_perf_ctrl and minidump_vcpu_stack stubs
+
+ColorOS 17 libSchedAssistExtImpl.so issues 48-byte _IOWR(0xFB, 1..8, ...)
+ioctls (0xc030fb01..0xc030fb08) on /proc/oplus_frame_boost_async/async_perf_ctrl,
+and init.oplus.debug.rc references /proc/minidump_vcpu_stack.
+
+Add clean no-op proc_ioctl/proc_compat_ioctl and read-only proc stubs in
+onyx_compat_nodes.c (automatically cleaned up on module exit via proc_dirs[]
+and proc_nodes[]).
+---
+diff --git a/vendor/oplus/kernel/onyx_stubs/onyx_compat_nodes.c b/vendor/oplus/kernel/onyx_stubs/onyx_compat_nodes.c
+--- a/vendor/oplus/kernel/onyx_stubs/onyx_compat_nodes.c
++++ b/vendor/oplus/kernel/onyx_stubs/onyx_compat_nodes.c
+@@ -43,6 +43,7 @@
+ 	{ NULL, "mm_fb", 0660, "" },
+ 	{ NULL, "pmicWd", 0660, "0", true },	/* no PMIC watchdog on onyx: reads report it off */
+ 	{ NULL, "kpdpwr", 0660, "0", true },
++	{ NULL, "minidump_vcpu_stack", 0440, "0", true },
+ };
+ 
+ /* /sys/kernel/wakelock_profiler, rc: init.oplus.rootdir.rc */
+@@ -170,7 +171,32 @@
+ 	.proc_ioctl = afs_ioctl,
+ };
+ 
+-static const char * const proc_dirs[] = { "nandswap", "rpmh_modem", "clk", "oplus_afs_config" };
++/*
++ * ColorOS 17 libSchedAssistExtImpl.so (ofbNotify{Enqueue,Dequeue,FocusChange,ActivityChange,
++ * ColdLaunch,Launch,Fling,Applet,Msg}) sends 48-byte _IOWR(0xFB, 1..8, ...) ioctls to
++ * /proc/oplus_frame_boost_async/async_perf_ctrl. Return 0 as a clean no-op stub.
++ */
++#define OFB_ASYNC_IOC_MAGIC	0xFB
++#define OFB_ASYNC_IOC_MIN	0xc030fb01U
++#define OFB_ASYNC_IOC_MAX	0xc030fb08U
++
++static long async_perf_ctrl_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
++{
++	if (cmd >= OFB_ASYNC_IOC_MIN && cmd <= OFB_ASYNC_IOC_MAX)
++		return 0;
++	return -ENOTTY;
++}
++
++static const struct proc_ops async_perf_ctrl_ops = {
++	.proc_ioctl = async_perf_ctrl_ioctl,
++#ifdef CONFIG_COMPAT
++	.proc_compat_ioctl = async_perf_ctrl_ioctl,
++#endif
++};
++
++static const char * const proc_dirs[] = {
++	"nandswap", "rpmh_modem", "clk", "oplus_afs_config", "oplus_frame_boost_async"
++};
+ static struct proc_dir_entry *dir_pde[ARRAY_SIZE(proc_dirs)];
+ static struct kobject *wl_kobj;
+ 
+@@ -214,6 +240,10 @@
+ 	}
+ 	if (parent_of("oplus_afs_config"))
+ 		made += !!proc_create("afs_config", 0666, parent_of("oplus_afs_config"), &afs_ops);
++	if (parent_of("oplus_frame_boost_async"))
++		made += !!proc_create("async_perf_ctrl", 0666,
++				      parent_of("oplus_frame_boost_async"),
++				      &async_perf_ctrl_ops);
+ 
+ 	wl_kobj = kobject_create_and_add("wakelock_profiler", kernel_kobj);
+ 	for (i = 0; wl_kobj && i < ARRAY_SIZE(sys_nodes); i++) {
+@@ -229,7 +259,7 @@
+ 	}
+ 
+ 	pr_info("onyx_compat_nodes: %d of %zu placeholder nodes\n", made,
+-		ARRAY_SIZE(proc_nodes) + ARRAY_SIZE(sys_nodes) + 1);
++		ARRAY_SIZE(proc_nodes) + ARRAY_SIZE(sys_nodes) + 2);
+ 	return 0;
+ }
+ 

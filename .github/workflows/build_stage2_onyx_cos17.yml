@@ -1,0 +1,315 @@
+name: Build Stage 2 Onyx COS17 Kernel & OPlus Modules
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_ref:
+        description: "Xiaomi_Kernel_OpenSource branch or commit (6.6.162 GKI KMI Gen 8)"
+        required: false
+        default: "onyx-v-oss"
+        type: string
+      kernel_tools_ref:
+        description: "Xiaomi_Kernel_OpenSource branch/commit containing tools/onyx/*"
+        required: false
+        default: "onyx-tools"
+        type: string
+      modules_ref:
+        description: "OnePlus SM8735 OPlus modules branch or commit (must include shutdown_detect fix)"
+        required: false
+        default: "onyx-port"
+        type: string
+      clang_url:
+        description: "Official Google AOSP clang-r510928 archive URL"
+        required: false
+        default: "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r510928.tar.gz"
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  KBUILD_BUILD_USER: build-user
+  KBUILD_BUILD_HOST: build-host
+  KERNEL_DIR: /home/runner/onyx-v-oss
+  MODULES_DIR: /home/runner/oplus-sm8735
+  TOOLCHAIN_DIR: /home/runner/onyx-toolchain/clang-r510928
+
+jobs:
+  build-stage2-onyx-cos17:
+    name: Build 6.6.162 Image + OPlus Modules (COS17 / Base HOS4)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Free runner disk space & install build dependencies
+        run: |
+          set -euo pipefail
+          echo "=== Disk before cleanup ==="
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev dwarves erofs-utils \
+            cpio lz4 zstd python3 kmod rsync zip curl ca-certificates git make
+          echo "=== Disk after cleanup ==="
+          df -h /
+          pahole --version
+
+      - name: Checkout Stage 2 CI kit (patches & workflow)
+        uses: actions/checkout@v4
+
+      - name: Shallow-clone kernel (onyx-v-oss + onyx-tools) & OPlus modules (onyx-port)
+        run: |
+          set -euo pipefail
+          git clone --depth=1 --branch "${{ inputs.kernel_ref }}" \
+            https://github.com/nischay12089/Xiaomi_Kernel_OpenSource.git "$KERNEL_DIR"
+          git -C "$KERNEL_DIR" fetch --depth=1 origin "${{ inputs.kernel_tools_ref }}"
+          mkdir -p "$RUNNER_TEMP/onyx-tools"
+          git -C "$KERNEL_DIR" show "FETCH_HEAD:tools/onyx/rebuild_vendor_dlkm.sh" \
+            > "$RUNNER_TEMP/onyx-tools/rebuild_vendor_dlkm.sh"
+          git -C "$KERNEL_DIR" show "FETCH_HEAD:tools/onyx/vb_drop_module.py" \
+            > "$RUNNER_TEMP/onyx-tools/vb_drop_module.py"
+          chmod +x "$RUNNER_TEMP/onyx-tools/rebuild_vendor_dlkm.sh" \
+                   "$RUNNER_TEMP/onyx-tools/vb_drop_module.py"
+
+          git clone --depth=1 --branch "${{ inputs.modules_ref }}" \
+            https://github.com/nischay12089/android_kernel_modules_and_devicetree_oneplus_sm8735.git \
+            "$MODULES_DIR"
+
+          echo "Kernel HEAD:  $(git -C "$KERNEL_DIR" rev-parse --short HEAD) ($(git -C "$KERNEL_DIR" log -1 --format=%s))"
+          echo "Modules HEAD: $(git -C "$MODULES_DIR" rev-parse --short HEAD) ($(git -C "$MODULES_DIR" log -1 --format=%s))"
+
+      - name: Apply Stage 2 HOS4 + COS17 patches cleanly
+        run: |
+          set -euo pipefail
+          for p in \
+            patches/0001-game-opt-bump-gts-idx-4-for-hos4-mi-reclaim.patch \
+            patches/0002-onyx-compat-nodes-add-cos17-async-perf-ctrl.patch; do
+            echo "=== Checking $p ==="
+            git -C "$MODULES_DIR" apply --check --verbose "$GITHUB_WORKSPACE/$p"
+            echo "=== Applying $p ==="
+            git -C "$MODULES_DIR" apply --verbose "$GITHUB_WORKSPACE/$p"
+          done
+          git -C "$MODULES_DIR" diff --stat
+
+      - name: Download official AOSP prebuilt clang-r510928
+        run: |
+          set -euo pipefail
+          mkdir -p "$TOOLCHAIN_DIR"
+          PRIMARY_URL="${{ inputs.clang_url }}"
+          FALLBACK_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-15.0.0_r1/clang-r510928.tar.gz"
+          if ! curl -fsSL --retry 3 --retry-delay 5 "$PRIMARY_URL" -o "$RUNNER_TEMP/clang-r510928.tar.gz"; then
+            echo "Primary clang URL failed; falling back to android-15.0.0_r1 tag..."
+            curl -fsSL --retry 3 --retry-delay 5 "$FALLBACK_URL" -o "$RUNNER_TEMP/clang-r510928.tar.gz"
+          fi
+          tar -xzf "$RUNNER_TEMP/clang-r510928.tar.gz" -C "$TOOLCHAIN_DIR"
+          rm -f "$RUNNER_TEMP/clang-r510928.tar.gz"
+          "$TOOLCHAIN_DIR/bin/clang" --version
+
+      - name: Build 6.6.162 kernel Image, Module.symvers & fixed bootmonitor.ko
+        run: |
+          set -euo pipefail
+          export PATH="$TOOLCHAIN_DIR/bin:$PATH"
+          cd "$KERNEL_DIR"
+          ./build_onyx.sh modules_prepare
+          # Ensure out/Module.symvers exists for out-of-tree builds
+          if [ ! -s out/Module.symvers ] && [ -s out/vmlinux.symvers ]; then
+            cp out/vmlinux.symvers out/Module.symvers
+          fi
+          # Build fixed bootmonitor.ko (fixes blkdev_put NULL holder bug still in Base HOS4)
+          make -j"$(nproc)" O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            KCFLAGS=-D__ANDROID_COMMON_KERNEL__ \
+            HOSTCFLAGS=-Wno-incompatible-pointer-types-discards-qualifiers \
+            LOCALVERSION= M=drivers/xiaomi/bootmonitor modules
+          ls -lh out/arch/arm64/boot/Image out/vmlinux out/Module.symvers \
+                 out/drivers/xiaomi/bootmonitor/bootmonitor.ko
+
+      - name: Build 9 coherent scheduler modules + pahole DWARF layout check
+        run: |
+          set -euo pipefail
+          export PATH="$TOOLCHAIN_DIR/bin:$PATH"
+          export KERNEL_OUT="$KERNEL_DIR/out"
+          export OPLUS_BUILD_OUT="$RUNNER_TEMP/oplus-scheduler-out"
+          cd "$MODULES_DIR"
+          ./onyx/build_scheduler.sh
+          cat "$OPLUS_BUILD_OUT/scheduler-artifacts.txt"
+
+      - name: Build remaining OPlus modules, game_opt (GTS_IDX=4), onyx_stubs & hybridswap zram.ko
+        run: |
+          set -euo pipefail
+          export PATH="$TOOLCHAIN_DIR/bin:$PATH"
+          KOUT="$KERNEL_DIR/out"
+          STAGE="$RUNNER_TEMP/stage2-bundle"
+          mkdir -p "$STAGE/vendor_dlkm/modules" "$STAGE/vendor_boot" "$STAGE/bootmonitor" \
+                   "$STAGE/tools" "$STAGE/patches" "$RUNNER_TEMP/mod-logs"
+
+          # 1. Copy coherent scheduler .ko artifacts
+          while IFS= read -r ko; do
+            [ -f "$ko" ] && cp -v "$ko" "$STAGE/vendor_dlkm/modules/"
+          done < "$RUNNER_TEMP/oplus-scheduler-out/scheduler-artifacts.txt"
+
+          SCHED_SYMVERS=$(tr '\n' ' ' < <(
+            for sub in cpu/sched/sched_assist cpu/sched/frame_boost cpu/sched/sched_info \
+                       cpu/sched/eas_opt cpu/sched/qos_sched cpu/sched/task_cpustats \
+                       cpu/sched/task_sched cpu/smart_freq cpu/oplus_omrg; do
+              echo "$MODULES_DIR/vendor/oplus/kernel/$sub/Module.symvers"
+            done
+          ))
+
+          # 2. Build 10 placeholder stubs + onyx_compat_nodes.ko (with COS17 async_perf_ctrl + minidump_vcpu_stack)
+          echo "=== Building onyx_stubs (10 placeholders + onyx_compat_nodes.ko) ==="
+          make -j"$(nproc)" -C "$KOUT" M="$MODULES_DIR/vendor/oplus/kernel/onyx_stubs" \
+            ARCH=arm64 LLVM=1 LLVM_IAS=1 modules
+          cp -v "$MODULES_DIR"/vendor/oplus/kernel/onyx_stubs/*.ko "$STAGE/vendor_dlkm/modules/"
+
+          # 3. Build first-stage hybridswap_zram -> vendor_boot/zram.ko
+          echo "=== Building first-stage hybridswap_zram (zram.ko) ==="
+          ZRAM_DIR="$MODULES_DIR/vendor/oplus/kernel/mm/hybridswap_zram"
+          make -s -C "$KOUT" M="$ZRAM_DIR" ARCH=arm64 LLVM=1 clean
+          make -j"$(nproc)" -C "$KOUT" M="$ZRAM_DIR" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            KCFLAGS="-D__ANDROID_COMMON_KERNEL__ -DCONFIG_HYBRIDSWAP_ZRAM=1 -DCONFIG_HYBRIDSWAP=1 -DCONFIG_HYBRIDSWAP_SWAPD=1 -DCONFIG_HYBRIDSWAP_CORE=1 -Wno-error=unused-function -Wno-error=unused-variable" \
+            CONFIG_HYBRIDSWAP_ZRAM=m CONFIG_HYBRIDSWAP=y CONFIG_HYBRIDSWAP_SWAPD=y CONFIG_HYBRIDSWAP_CORE=y \
+            modules
+          cp -v "$ZRAM_DIR/zram.ko" "$STAGE/vendor_boot/zram.ko"
+
+          # 4. Build oplus_bsp_game_opt.ko with GTS_IDX=4 (Patch 0001)
+          echo "=== Building oplus_bsp_game_opt.ko (GTS_IDX=4) ==="
+          GAME_DIR="$MODULES_DIR/vendor/oplus/kernel/cpu/game_opt"
+          cat > "$GAME_DIR/Kbuild" <<'EOF'
+          obj-m += oplus_bsp_game_opt.o
+          oplus_bsp_game_opt-y := \
+            cpu_load.o cpufreq_limits.o debug.o dsu_freq.o early_detect.o \
+            fake_cpufreq.o game_ctrl.o rt_info.o multi_rt_info.o \
+            task_load_track.o task_util.o multi_task_util.o yield_opt.o \
+            frame_load.o frame_sync.o task_boost/heavy_task_boost.o \
+            task_boost/boost_proc.o frame_detect/frame_detect.o \
+            oem_data/game_oem_data.o critical_task_boost.o geas_ctrl.o
+          ccflags-y += -I$(src) -I$(src)/oem_data -I$(src)/task_boost -I$(src)/frame_detect
+          EOF
+          if make -j"$(nproc)" -C "$KOUT" M="$GAME_DIR" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            KCFLAGS="-D__ANDROID_COMMON_KERNEL__ -Wno-error=unused-function -Wno-error=unused-variable" \
+            KBUILD_EXTRA_SYMBOLS="$SCHED_SYMVERS" modules > "$RUNNER_TEMP/mod-logs/game_opt.log" 2>&1; then
+            cp -v "$GAME_DIR/oplus_bsp_game_opt.ko" "$STAGE/vendor_dlkm/modules/"
+          else
+            echo "::warning::oplus_bsp_game_opt.ko build failed; tail of log:"
+            tail -40 "$RUNNER_TEMP/mod-logs/game_opt.log"
+          fi
+
+          # 5. Build core OPlus modules via Nischay's build_oplus_mod.sh
+          cd "$MODULES_DIR"
+          export KERNEL_OUT="$KOUT"
+          export KBUILD_EXTRA_SYMBOLS="$SCHED_SYMVERS"
+
+          build_mod() {
+            local required="$1"; shift
+            local sub="$1"; shift
+            local log="$RUNNER_TEMP/mod-logs/${sub//\//_}.log"
+            echo "=== Building $sub ($*) ==="
+            if ./build_oplus_mod.sh "$sub" "$@" > "$log" 2>&1; then
+              while IFS= read -r ko; do
+                [ -f "$ko" ] && cp -v "$ko" "$STAGE/vendor_dlkm/modules/"
+              done < "$log"
+              if [ -f "$MODULES_DIR/vendor/oplus/kernel/$sub/Module.symvers" ]; then
+                export KBUILD_EXTRA_SYMBOLS="$KBUILD_EXTRA_SYMBOLS $MODULES_DIR/vendor/oplus/kernel/$sub/Module.symvers"
+              fi
+            else
+              if [ "$required" = "req" ]; then
+                echo "::error::Required module $sub failed to build:"
+                tail -40 "$log"
+                exit 1
+              else
+                echo "::warning::Optional module $sub failed to build (continuing):"
+                tail -25 "$log"
+              fi
+            fi
+          }
+
+          # Mandatory core OPlus framework/mm/ipc/sync/dfr modules
+          build_mod req ipc CONFIG_OPLUS_BINDER_STRATEGY=m
+          build_mod req synchronize CONFIG_OPLUS_LOCKING_STRATEGY=m
+          build_mod req hans CONFIG_OPLUS_FEATURE_HANS_GKI=m
+          build_mod req framework_stability/oplus_stability_helper CONFIG_OPLUS_FEATURE_STABILITY_HELPER=m
+          build_mod req mm/mm_osvelte CONFIG_OPLUS_FEATURE_MM_OSVELTE=m
+          build_mod req mm/mglru_opt CONFIG_OPLUS_FEATURE_MGLRU_OPT=m
+          build_mod req mm/uxmem_opt CONFIG_OPLUS_FEATURE_UXMEM_OPT=m
+          build_mod req mm/sigkill_diagnosis CONFIG_OPLUS_FEATURE_SIGKILL_DIAGNOSIS=m
+          build_mod req mm/exit_mm_optimize CONFIG_OPLUS_EXIT_MM_OPTIMIZE=m
+          build_mod req boot/oplus_projectinfo CONFIG_OPLUS_FEATURE_OPROJECT=m
+          build_mod req boot/oplus_phoenix CONFIG_OPLUS_FEATURE_PHOENIX=m CONFIG_OPLUS_FEATURE_PHOENIX_REBOOT_SPEED=m
+          build_mod req dfr/common/shutdown_detect CONFIG_OPLUS_FEATURE_SHUTDOWN_DETECT=m
+          build_mod req dfr/common/theia CONFIG_OPLUS_FEATURE_THEIA=m
+          build_mod req dfr/common/kp_freeze_detect CONFIG_OPLUS_FEATURE_KP_FREEZE_DETECT=m
+          build_mod req dfr/common/init_watchdog CONFIG_OPLUS_FEATURE_INIT_WATCHDOG=m
+          build_mod req dfr/common/oplus_saupwk CONFIG_OPLUS_FEATURE_SAUPWK=m
+          build_mod req dfr/qcom/dump_device_info CONFIG_OPLUS_FEATURE_DUMP_DEVICE_INFO=m
+          build_mod req dfr/qcom/dump_reason CONFIG_OPLUS_FEATURE_DUMP_REASON=m
+          build_mod req dfr/qcom/qcom_pmic_monitor CONFIG_OPLUS_FEATURE_PMIC_MONITOR=m
+          build_mod req device_info/device_info CONFIG_OPLUS_DEVICE_IFNO=m
+          build_mod req storage/common/io_metrics CONFIG_OPLUS_FEATURE_STORAGE_IO_METRICS=m
+          build_mod req storage/storage_feature_in_module/common/ufs_oplus_dbg CONFIG_OPLUS_UFS_DRIVER=m
+          build_mod req power/standby_netlink CONFIG_OPLUS_FEATURE_POWER_NETLINK=m
+          build_mod req power/subsys_sleep_monitor/oplus_subsys_sleep_monitor CONFIG_OPLUS_SUBSYS_SLEEP_MONITOR=m
+          build_mod req wifi/oplus_connectivity_routerboost CONFIG_OPLUS_FEATURE_WIFI_ROUTERBOOST=m
+          build_mod req wifi/oplus_connectivity_sla CONFIG_OPLUS_FEATURE_WIFI_SLA=m
+          build_mod req wifi/oplus_wifi_wsa CONFIG_OPLUS_FEATURE_WIFI_SMARTANTENNA=m
+          build_mod req wifi/oplus_wificapcenter CONFIG_OPLUS_FEATURE_WIFI_CAPCENTER=m
+
+          # Additional OPlus modules (optional/best-effort)
+          build_mod opt mm/levelprotect CONFIG_OPLUS_LEVEL_PROTECT=m CONFIG_OPLUS_FG_PROTECT=m
+          build_mod opt network/data_module CONFIG_OPLUS_FEATURE_DATA_MODULE=m
+          build_mod opt network/oplus_apps_monitor CONFIG_OPLUS_FEATURE_APP_MONITOR=m
+          build_mod opt network/oplus_dns_hook CONFIG_OPLUS_FEATURE_DNS_HOOK=m
+          build_mod opt network/oplus_game_first CONFIG_OPLUS_FEATURE_GAME_FIRST=m
+          build_mod opt network/oplus_network_tuning CONFIG_OPLUS_FEATURE_KERNEL_NETWORK_PARA=m
+          build_mod opt network/oplus_qr_scan CONFIG_OPLUS_FEATURE_QR_SCAN=m
+          build_mod opt network/oplus_score CONFIG_OPLUS_FEATURE_DATA_EVAL=m
+          build_mod opt network/oplus_stats_calc CONFIG_OPLUS_FEATURE_STATS_CALC=m
+
+          # Direct obj-m modules (no CONFIG_OPLUS_* gate in Makefile)
+          for direct_sub in cpu/thermal graphics dfr/qcom/oplus_ordump dfr/common/last_boot_reason; do
+            echo "=== Building direct obj-m module: $direct_sub ==="
+            DIR="$MODULES_DIR/vendor/oplus/kernel/$direct_sub"
+            make -s -C "$KOUT" M="$DIR" ARCH=arm64 LLVM=1 clean
+            make -j"$(nproc)" -C "$KOUT" M="$DIR" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+              KCFLAGS="-D__ANDROID_COMMON_KERNEL__ -Wno-error=unused-function -Wno-error=unused-variable" \
+              OPLUS_OUT_OF_TREE_KO=y KBUILD_EXTRA_SYMBOLS="$KBUILD_EXTRA_SYMBOLS" modules
+            cp -v "$DIR"/*.ko "$STAGE/vendor_dlkm/modules/"
+          done
+
+      - name: Package Stage2_Onyx_COS17_Kernel_Modules_Bundle.zip
+        run: |
+          set -euo pipefail
+          STAGE="$RUNNER_TEMP/stage2-bundle"
+          cp -v "$KERNEL_DIR/out/arch/arm64/boot/Image" "$STAGE/Image"
+          cp -v "$KERNEL_DIR/out/drivers/xiaomi/bootmonitor/bootmonitor.ko" "$STAGE/bootmonitor/bootmonitor.ko"
+          cp -v "$RUNNER_TEMP/onyx-tools/rebuild_vendor_dlkm.sh" "$STAGE/tools/"
+          cp -v "$RUNNER_TEMP/onyx-tools/vb_drop_module.py" "$STAGE/tools/"
+          cp -v "$GITHUB_WORKSPACE"/patches/*.patch "$STAGE/patches/"
+
+          # Generate Unix-LF oplus_manifest.txt relative to vendor_dlkm/
+          (cd "$STAGE/vendor_dlkm" && find modules -maxdepth 1 -name '*.ko' -type f | sort > oplus_manifest.txt)
+
+          # Write build metadata & SHA-256 manifest
+          {
+            echo "Stage 2 Onyx (POCO F7 / SM8735) ColorOS 17 + Base HOS4 Kernel & Modules Bundle"
+            echo "Built UTC:     $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            echo "Kernel ref:    ${{ inputs.kernel_ref }} @ $(git -C "$KERNEL_DIR" rev-parse HEAD)"
+            echo "Modules ref:   ${{ inputs.modules_ref }} @ $(git -C "$MODULES_DIR" rev-parse HEAD)"
+            echo "Patches:       0001-game-opt-bump-gts-idx-4-for-hos4-mi-reclaim.patch"
+            echo "               0002-onyx-compat-nodes-add-cos17-async-perf-ctrl.patch"
+            echo "DLKM .ko count: $(wc -l < "$STAGE/vendor_dlkm/oplus_manifest.txt")"
+            echo ""
+            echo "=== SHA-256 Checksums ==="
+            (cd "$STAGE" && find . -type f ! -name BUILD_INFO.txt | sort | xargs sha256sum)
+          } > "$STAGE/BUILD_INFO.txt"
+
+          cat "$STAGE/BUILD_INFO.txt"
+          (cd "$STAGE" && zip -r -9 "$RUNNER_TEMP/Stage2_Onyx_COS17_Kernel_Modules_Bundle.zip" .)
+          ls -lh "$RUNNER_TEMP/Stage2_Onyx_COS17_Kernel_Modules_Bundle.zip"
+
+      - name: Upload Stage2_Onyx_COS17_Kernel_Modules_Bundle.zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Stage2_Onyx_COS17_Kernel_Modules_Bundle
+          path: ${{ runner.temp }}/Stage2_Onyx_COS17_Kernel_Modules_Bundle.zip
+          retention-days: 30
