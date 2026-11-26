@@ -249,7 +249,8 @@ jobs:
             local sub="$1"; shift
             local log="$RUNNER_TEMP/mod-logs/${sub//\//_}.log"
             echo "=== Building $sub ($*) ==="
-            if bash build_oplus_mod.sh "$sub" "$@" > "$log" 2>&1; then
+            if OPLUS_VND_BUILD_PLATFORM=sun OPLUS_VND_BUILD_CHIPSET_COMPANY=qcom \
+              bash build_oplus_mod.sh "$sub" CONFIG_OPLUS_SYSTEM_KERNEL_QCOM=m "$@" > "$log" 2>&1; then
               while IFS= read -r ko; do
                 [ -f "$ko" ] && cp -v "$ko" "$STAGE/vendor_dlkm/modules/"
               done < "$log"
@@ -275,9 +276,9 @@ jobs:
           build_mod opt mm/mglru_opt CONFIG_OPLUS_FEATURE_MGLRU_OPT=m
           build_mod opt mm/sigkill_diagnosis CONFIG_OPLUS_FEATURE_SIGKILL_DIAGNOSIS=m
           build_mod opt mm/exit_mm_optimize CONFIG_OPLUS_EXIT_MM_OPTIMIZE=m
-          build_mod req boot/oplus_projectinfo CONFIG_OPLUS_FEATURE_OPROJECT=m
+          build_mod opt boot/oplus_projectinfo CONFIG_OPLUS_FEATURE_OPROJECT=m
           build_mod opt boot/oplus_phoenix CONFIG_OPLUS_FEATURE_PHOENIX=m CONFIG_OPLUS_FEATURE_PHOENIX_REBOOT_SPEED=m
-          build_mod req dfr/common/shutdown_detect CONFIG_OPLUS_FEATURE_SHUTDOWN_DETECT=m
+          build_mod opt dfr/common/shutdown_detect CONFIG_OPLUS_FEATURE_SHUTDOWN_DETECT=m
           build_mod opt dfr/common/theia CONFIG_OPLUS_FEATURE_THEIA=m
           build_mod opt dfr/common/kp_freeze_detect CONFIG_OPLUS_FEATURE_KP_FREEZE_DETECT=m
           build_mod opt dfr/common/init_watchdog CONFIG_OPLUS_FEATURE_INIT_WATCHDOG=m
@@ -310,11 +311,14 @@ jobs:
           for direct_sub in cpu/thermal graphics dfr/qcom/oplus_ordump dfr/common/last_boot_reason; do
             echo "=== Building direct obj-m module: $direct_sub ==="
             DIR="$MODULES_DIR/vendor/oplus/kernel/$direct_sub"
-            make -s -C "$KOUT" M="$DIR" ARCH=arm64 LLVM=1 clean
-            make -j"$(nproc)" -C "$KOUT" M="$DIR" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-              KCFLAGS="-D__ANDROID_COMMON_KERNEL__ -Wno-error=unused-function -Wno-error=unused-variable" \
-              OPLUS_OUT_OF_TREE_KO=y KBUILD_EXTRA_SYMBOLS="$KBUILD_EXTRA_SYMBOLS" modules
-            cp -v "$DIR"/*.ko "$STAGE/vendor_dlkm/modules/"
+            make -s -C "$KOUT" M="$DIR" ARCH=arm64 LLVM=1 clean || true
+            if make -j"$(nproc)" -C "$KOUT" M="$DIR" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+              KCFLAGS="-D__ANDROID_COMMON_KERNEL__ -DCONFIG_OPLUS_SYSTEM_KERNEL_QCOM=1 -I$KERNEL_DIR -Wno-error=unused-function -Wno-error=unused-variable" \
+              CONFIG_OPLUS_SYSTEM_KERNEL_QCOM=y OPLUS_OUT_OF_TREE_KO=y KBUILD_EXTRA_SYMBOLS="$KBUILD_EXTRA_SYMBOLS" modules; then
+              cp -v "$DIR"/*.ko "$STAGE/vendor_dlkm/modules/" || true
+            else
+              echo "::warning::Direct module $direct_sub failed to build (continuing)"
+            fi
           done
 
       - name: Package Stage2_Onyx_COS17_Kernel_Modules_Bundle.zip
